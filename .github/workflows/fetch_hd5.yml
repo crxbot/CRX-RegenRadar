@@ -129,7 +129,7 @@ jobs:
         run: |
           python scripts/generate_metadata.py output \
             --run "${{ steps.set_run_date.outputs.run }}" \
-            --date "$DATE" \
+            --date "$BERLIN_DATE" \
             --existing ./metadata_prev.json \
             --max-keep "$MAX_KEEP" \
             --meta-out ./metadata.json \
