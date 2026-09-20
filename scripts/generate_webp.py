@@ -338,23 +338,33 @@ def refine_precipitation_classes(
 ) -> np.ndarray:
     refined = class_merc.copy()
 
-    if rate_merc is None:
-        # Keine RV-Daten verfuegbar: Basis-Codes bleiben wie sie sind.
-        return refined
-
     for base_class, thresholds in REFINEMENT_CONFIG.items():
         mask_base = class_merc == base_class
         if not np.any(mask_base):
             continue
-        valid_rate = mask_base & ~np.isnan(rate_merc)
+
+        # Niedrigste Stufe der jeweiligen Klasse (Regen -> 31, Schnee -> 71)
+        fallback_code = thresholds[0][2]
+
+        if rate_merc is None:
+            # Keine RV-Daten: Basis-Klasse in ihre niedrigste Stufe umwandeln
+            refined[mask_base] = fallback_code
+            continue
+
+        has_rate = ~np.isnan(rate_merc)
+
+        # 1) Pixel MIT RV-Wert: nach Schwellen einteilen
         for lower, upper, new_code in thresholds:
-            m = valid_rate & (rate_merc >= lower) & (rate_merc < upper)
+            m = mask_base & has_rate & (rate_merc >= lower) & (rate_merc < upper)
             refined[m] = new_code
-        # Alles, was Basis-Code geblieben ist (kein RY-Wert oder < 0.1 mm/h), ausblenden
+
+        # 2) Pixel OHNE RV-Wert (Nodata / außerhalb des Rasters): Fallback-Stufe
+        refined[mask_base & ~has_rate] = fallback_code
+
+        # 3) Pixel MIT RV-Wert, aber unter der untersten Schwelle: ausblenden
         refined[mask_base & (refined == base_class)] = INVISIBLE_CLASS
 
     return refined
-
 
 # --------------------------------------------------------------------------- #
 # Einfärben
