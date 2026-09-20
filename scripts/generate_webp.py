@@ -388,7 +388,7 @@ def main() -> None:
     rgba = colorize(rate_merc)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / f"liveanalyse_{ts.astimezone(BERLIN):%Y%m%d_%H%M}.webp"
+    out_path = OUT_DIR / f"regenradar_{ts.astimezone(BERLIN):%Y%m%d_%H%M}.webp"
     # Zeilen umdrehen: y_new läuft von Süd nach Nord, Bilder von oben nach unten
     Image.fromarray(rgba[::-1], mode="RGBA").save(out_path, format="WEBP", lossless=True)
     print(f"Gespeichert: {out_path}")
