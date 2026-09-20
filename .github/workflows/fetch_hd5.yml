@@ -130,7 +130,7 @@ jobs:
         run: |
           aws s3 cp \
             "output/rv/regenradar_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
-            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/regenradar${BERLIN_DATE}_${BERLIN_TIME}.webp" \
+            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/regenradar_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
             --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
