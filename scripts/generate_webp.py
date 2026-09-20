@@ -1,84 +1,113 @@
 #!/usr/bin/env python3
+"""RV-Composite (DWD, ODIM-HDF5) -> farbiges WebP in EPSG:3857."""
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from scipy.signal import fftconvolve
-import base64
-import zlib
-from scipy import ndimage
 
 import h5py
 import numpy as np
-import requests
 from PIL import Image
 from pyproj import Transformer
 
 # --------------------------------------------------------------------------- #
 # Konfiguration
 # --------------------------------------------------------------------------- #
-SRC_DIR = Path("data/hymecng")
-OUT_DIR = Path("output/hymecng")
+SRC_DIR = Path("data/rv")
+OUT_DIR = Path("output/rv")
 
-FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
+FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
 
-# Normale HymecNG-Codes -> Farbe.
-# Code 2 wurde entfernt (wird ausgeblendet, siehe refine_precipitation_classes).
-# Code 3 bleibt als Fallback-Farbe erhalten fuer Pixel ohne RV-Abdeckung.
-# Codes 31/32/33 sind die RV-verfeinerten Regen-Intensitaeten.
-PRECIP_COLORS: dict[int, str] = {
-    2: "#43FF43",
-    31: "#43FF43",  # Regen leicht
-    32: "#34C134",  # Regen maessig
-    33: "#008200",  # Regen stark
-    4: "#FF4343",
-    5: "#FF4343",
-    6: "#FFA500",
-    7: "#47F0FF",
-    71: "#47F0FF",
-    72: "#478CFF",
-    73: "#3568BD",
-    8: "#3568BD",
-    9: "#008000",   # Hagel
-    10: "#008000",  # Hagel
-}
-HAIL_CLASSES = {9, 10}
+# Falls das Dataset als Akkumulation (quantity=ACRR) vorliegt: Laenge des
+# Akkumulationsintervalls in Minuten -> Umrechnung auf mm/h (RV = 5 min).
+RV_ACCUM_MINUTES = 5
+# Fallbacks, falls die Attribute (gain/nodata) in der Datei fehlen
+RV_DEFAULT_GAIN = 0.01
+RV_DEFAULT_NODATA = 65535
 
-# mm/h-Schwellen fuer Regen (Code 3 -> 31/32/33). [lower, upper, neuer_code]
-# upper ist exklusiv. PLATZHALTER - bitte pruefen/anpassen!
-RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.01, 1.3, 31),           # leicht
-    (1.3, 13.0, 32),          # maessig
-    (13.0, float("inf"), 33), # stark
+MIN_VISIBLE_MMH = 0.01      # darunter: transparent
+WHITE_MAX_MMH = 0.09        # ab hier volle Weiß-Deckkraft der Rampe
+WHITE_ALPHA_MIN = 20        # Alpha bei 0.01 mm/h (0-255)
+WHITE_ALPHA_MAX = 160       # Alpha bei 0.09 mm/h (0-255)
+
+# Farbtabelle: (mm/h, (R, G, B))
+# Diskrete Stufen: jeder Wert bekommt die Farbe der letzten Schwelle <= Wert.
+MIN_VISIBLE_MMH = 0.01      # darunter: transparent
+
+COLOR_TABLE: list[tuple[float, tuple[int, int, int]]] = [
+    (0.1,   (0, 221, 238)),
+    (0.12,  (0, 206, 240)),
+    (0.14,  (1, 190, 242)),
+    (0.16,  (1, 175, 244)),
+    (0.18,  (1, 160, 246)),
+    (0.2,   (1, 160, 246)),
+    (0.24,  (1, 120, 246)),
+    (0.28,  (1, 80, 246)),
+    (0.32,  (0, 40, 246)),
+    (0.36,  (0, 0, 246)),
+
+    # Grün-Phase: leichter Regen 0.4-4.5 mm/h
+    (0.4,   (0, 255, 0)),
+    (0.52,  (0, 246, 0)),
+    (0.64,  (0, 237, 0)),
+    (0.76,  (0, 228, 0)),
+    (0.88,  (0, 218, 0)),
+    (1.0,   (0, 209, 0)),
+    (1.26,  (0, 200, 0)),
+    (1.52,  (0, 200, 0)),
+    (1.78,  (0, 192, 0)),
+    (2.04,  (0, 184, 0)),
+    (2.3,   (0, 176, 0)),
+    (2.86,  (0, 168, 0)),
+    (3.42,  (0, 160, 0)),
+    (3.98,  (0, 152, 0)),
+    (4.56,  (0, 144, 0)),
+
+    # Gelb-Phase:
+    (5.1,   (255, 255, 0)),
+    (6.48,  (249, 239, 0)),
+    (7.86,  (243, 224, 0)),
+    (9.24,  (237, 208, 0)),
+    (10.62, (231, 192, 0)),
+    (12.0,  (231, 192, 0)),
+    (14.4,  (237, 180, 0)),
+    (16.8,  (243, 168, 0)),
+    (19.2,  (249, 156, 0)),
+    (21.6,  (255, 144, 0)),
+
+    # Orange-Phase:
+    (24.0,  (255, 144, 0)),
+    (28.0,  (255, 108, 0)),
+    (32.0,  (255, 72, 0)),
+
+    # Rot-Phase:
+    (36.0,  (255, 36, 0)),
+    (40.0,  (255, 0, 0)),
+    (44.0,  (255, 0, 0)),
+    (51.2,  (245, 0, 0)),
+    (58.4,  (235, 0, 0)),
+    (65.6,  (224, 0, 0)),
+    (72.8,  (214, 0, 0)),
+    (80.0,  (214, 0, 0)),
+    (93.2,  (201, 0, 0)),
+    (106.4, (187, 0, 0)),
+    (119.6, (174, 0, 0)),
+    (132.8, (160, 0, 0)),
+
+    # Violett-Phase:
+    (146.0, (255, 200, 255)),
+    (170.4, (244, 180, 244)),
+    (194.8, (232, 160, 232)),
+    (219.2, (221, 140, 221)),
+    (243.6, (209, 120, 209)),
+    (268.0, (198, 100, 198)),
+    (312.6, (186, 80, 186)),
+    (357.2, (175, 60, 175)),
+    (401.8, (163, 40, 163)),
+    (446.4, (152, 20, 152)),
+    (491.0, (140, 0, 140)),
 ]
-
-# mm/h-Schwellen fuer Schnee - PLATZHALTER, bitte pruefen/anpassen!
-# Schnee hat i.d.R. ein geringeres fluessiges Aequivalent pro Zeiteinheit,
-# daher tendenziell niedrigere Schwellen als bei Regen.
-SNOW_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.1, 1.0, 71),           # leicht
-    (1.0, 4.0, 72),           # maessig
-    (4.0, float("inf"), 73),  # stark
-]
-
-# Welche HymecNG-Basis-Codes werden ueber RV verfeinert?
-# Nur Regen (3) ist aktuell aktiv. Sobald klar ist, welcher HymecNG-Code
-# tatsaechlich "Schnee" ist (vermutlich 7, evtl. auch 8), einfach eine
-# Zeile hinzufuegen, z.B.:
-#   REFINEMENT_CONFIG[7] = SNOW_MMH_THRESHOLDS
-REFINEMENT_CONFIG: dict[int, list[tuple[float, float, int]]] = {
-    3: RAIN_MMH_THRESHOLDS,
-    7: SNOW_MMH_THRESHOLDS,
-}
-
-# Blitze
-THUNDER_COLOR = "#FD5FFF"
-STRONG_THUNDER_COLOR = "#BA1ABC"  # Blitz in Hagelzone
-LIGHTNING_BASE_URL = "https://radar.wetterstation-neustadt.de/blitze/archive/"
-LIGHTNING_BACKUP_URL = "https://nowsky.vercel.app/api/lightning"
-LIGHTNING_WINDOW_MINUTES = 5
-LIGHTNING_MARKER_RADIUS_PX = 8
 
 # Geometrie / Ausgabe
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -86,36 +115,11 @@ WEBMERCATOR_OUT_WIDTH = 1400
 EDGE_SAMPLES = 200
 BBOX_MARGIN_DEG = 0.02
 EARTH_RADIUS = 6378137.0
-NODATA_CLASS = -1
-INVISIBLE_CLASS = 1   # Regen ohne RY-Wert -> nicht dargestellt
-
-
-BRIGHTSKY_RADAR_URL = "https://api.brightsky.dev/radar"
-BRIGHTSKY_PROJ = (
-    "+proj=stere +lat_0=90 +lat_ts=60 +lon_0=10 +a=6378137 "
-    "+b=6356752.3142451802 +no_defs "
-    "+x_0=543196.83521776402 +y_0=3622588.8619310018"
-)
-BRIGHTSKY_XSIZE = 1100
-BRIGHTSKY_YSIZE = 1200
-BRIGHTSKY_RES_M = 1000.0
-BRIGHTSKY_NODATA = 65535
-
-# Code 1 Nearest
-FILL_UNCLASSIFIABLE_CODE = 1
-FILL_RADIUS_PX = 8          # Suchradius um jeden Code-1-Pixel
-FILL_MIN_NEIGHBORS = 4      # mind. so viele Niederschlags-Pixel im Radius, sonst bleibt 1
-PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]   # nur echte Niederschlagsklassen
 
 
 # --------------------------------------------------------------------------- #
 # Hilfsfunktionen
 # --------------------------------------------------------------------------- #
-def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    h = hex_color.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
 def lonlat_to_webmercator(lon_deg, lat_deg):
     x = EARTH_RADIUS * np.radians(lon_deg)
     y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
@@ -128,22 +132,24 @@ def webmercator_to_lonlat(x, y):
     return lon, lat
 
 
-def parse_timestamp(filename: str) -> datetime:
-    """Zeitstempel aus dem HymecNG-Dateinamen (UTC)."""
+def parse_filename(filename: str) -> tuple[datetime, int]:
+    """Liefert (Basiszeit UTC, Vorhersageschritt in Minuten) aus dem RV-Dateinamen."""
     m = FILENAME_RE.match(filename)
     if not m:
         raise ValueError(
             "Dateiname passt nicht zum Schema "
-            f"'composite_HymecNG_yyyymmdd_HHMM_000-hd5': {filename}"
+            f"'composite_rv_yyyymmdd_HHMM_LLL-hd5': {filename}"
         )
-    date_str, time_str, _ = m.groups()
+    date_str, time_str, lead_str = m.groups()
     naive = datetime.strptime(date_str + time_str, "%Y%m%d%H%M")
-    return naive.replace(tzinfo=timezone.utc)
+    return naive.replace(tzinfo=timezone.utc), int(lead_str)
+
 
 # --------------------------------------------------------------------------- #
 # HDF5 lesen
 # --------------------------------------------------------------------------- #
-def _find_2d_dataset_by_quantity(h5file: h5py.File, keywords: tuple[str, ...], error_msg: str) -> h5py.Dataset:
+def find_rate_dataset(h5file: h5py.File) -> h5py.Dataset:
+    """Sucht das 2D-Niederschlags-Dataset; Fallback: erstes 2D-Dataset."""
     candidates: list[h5py.Dataset] = []
 
     def visitor(name, obj):
@@ -152,26 +158,61 @@ def _find_2d_dataset_by_quantity(h5file: h5py.File, keywords: tuple[str, ...], e
 
     h5file.visititems(visitor)
     if not candidates:
-        raise RuntimeError(error_msg)
+        raise RuntimeError("Kein 2D-Datensatz in der RV-Datei gefunden.")
 
     for ds in candidates:
         what = ds.parent.get("what")
         if what is not None and "quantity" in what.attrs:
-            quantity = what.attrs["quantity"]
-            if isinstance(quantity, bytes):
-                quantity = quantity.decode(errors="ignore")
-            if any(k in str(quantity).upper() for k in keywords):
+            q = _attr_str(what.attrs["quantity"]).upper()
+            if any(k in q for k in ("ACRR", "RATE", "PRECIP", "RR")):
                 return ds
     return candidates[0]
 
 
-def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
-    """Sucht das 2D-Klassifikations-Dataset (HymecNG); Fallback: erstes 2D-Dataset."""
-    return _find_2d_dataset_by_quantity(
-        h5file,
-        keywords=("CLASS", "PRECIP", "HCLASS", "TYPE"),
-        error_msg="Kein 2D-Datensatz in der HymecNG-Datei gefunden.",
+def _attr_str(v) -> str:
+    return v.decode(errors="ignore") if isinstance(v, bytes) else str(v)
+
+
+def _scalar(v):
+    return v.item() if isinstance(v, np.ndarray) and v.size == 1 else v
+
+
+def read_rate_mmh(ds: h5py.Dataset) -> np.ndarray:
+    """Liest das Dataset und gibt mm/h als float64 zurueck (NaN = kein Datum)."""
+    # 'what'-Gruppe der Daten, sonst eine Ebene hoeher, sonst Root
+    what = None
+    for grp in (ds.parent, ds.parent.parent, ds.file):
+        w = grp.get("what")
+        if w is not None and "gain" in w.attrs:
+            what = w
+            break
+    attrs = what.attrs if what is not None else {}
+
+    gain = float(_scalar(attrs.get("gain", RV_DEFAULT_GAIN)))
+    offset = float(_scalar(attrs.get("offset", 0.0)))
+    nodata = _scalar(attrs.get("nodata", RV_DEFAULT_NODATA))
+    undetect = _scalar(attrs["undetect"]) if "undetect" in attrs else None
+    quantity = _attr_str(attrs.get("quantity", "")).upper()
+
+    raw = ds[()]
+    values = raw.astype(np.float64) * gain + offset
+
+    factor = 60.0 / RV_ACCUM_MINUTES if "ACRR" in quantity else 1.0
+    values *= factor
+
+    values[raw == nodata] = np.nan
+    if undetect is not None and undetect != nodata:
+        values[raw == undetect] = 0.0
+
+    print(
+        f"RV-Dataset: quantity='{quantity}', gain={gain}, offset={offset}, "
+        f"nodata={nodata}, undetect={undetect}, Faktor->mm/h={factor:g}"
     )
+    valid = values[np.isfinite(values)]
+    if valid.size:
+        print(f"Wertebereich: {valid.min():.2f} .. {valid.max():.2f} mm/h")
+    return values
+
 
 def find_where_group(h5file: h5py.File) -> h5py.Group | None:
     required = ("projdef", "xsize", "ysize", "xscale", "yscale", "LL_lon", "LL_lat")
@@ -195,11 +236,10 @@ def find_where_group(h5file: h5py.File) -> h5py.Group | None:
 
 def extract_grid_info(where: h5py.Group) -> dict:
     def as_str(key: str) -> str:
-        v = where.attrs[key]
-        return v.decode() if isinstance(v, bytes) else str(v)
+        return _attr_str(where.attrs[key])
 
     def as_float(key: str) -> float:
-        return float(where.attrs[key])
+        return float(_scalar(where.attrs[key]))
 
     return {
         "projdef": as_str("projdef"),
@@ -254,16 +294,9 @@ def nearest_neighbor_warp(
     to_proj: Transformer,
     x_new: np.ndarray,
     y_new: np.ndarray,
-    fill_value: float,
+    fill_value: float = np.nan,
 ) -> np.ndarray:
-    """Nearest-Neighbor-Warp eines beliebigen nativen Rasters auf EPSG:3857.
-
-    Arbeitet ausschliesslich mit dem uebergebenen 'grid' (eigene
-    xsize/ysize/xscale/yscale/Ursprung). Dadurch ist es unerheblich, ob das
-    RV-Quellraster eine andere Aufloesung/Groesse als das HymecNG-Raster hat
-    - beide werden unabhaengig voneinander korrekt in das gemeinsame
-    Zielraster (x_new/y_new) gesampled.
-    """
+    """Nearest-Neighbor-Warp des nativen Rasters auf das EPSG:3857-Zielraster."""
     xx, yy = np.meshgrid(x_new, y_new)
     lon, lat = webmercator_to_lonlat(xx, yy)
     x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
@@ -271,9 +304,12 @@ def nearest_neighbor_warp(
     y_nat = np.asarray(y_nat).reshape(xx.shape)
 
     ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
-    
-    col = np.round((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
-    row = np.round(grid["ysize"] - 1 - (y_nat - ll_y) / grid["yscale"]).astype(np.int64)
+
+    # ODIM: LL_lon/LL_lat = untere linke Ecke des Rasters -> floor
+    # (bei 1 km Aufloesung ist der Unterschied zu round() nur ein halber Pixel;
+    #  falls das Bild gegenueber frueher verschoben wirkt, hier wieder round() nehmen)
+    col = np.floor((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
+    row = (grid["ysize"] - 1 - np.floor((y_nat - ll_y) / grid["yscale"])).astype(np.int64)
     valid = (col >= 0) & (col < grid["xsize"]) & (row >= 0) & (row < grid["ysize"])
 
     out = np.full(xx.shape, fill_value, dtype=np.float64)
@@ -281,279 +317,62 @@ def nearest_neighbor_warp(
     return out
 
 
-def warp_classification_to_webmercator(
-    class_array: np.ndarray,
-    grid: dict,
-    to_proj: Transformer,
-    x_new: np.ndarray,
-    y_new: np.ndarray,
-) -> np.ndarray:
-    """Wrapper um nearest_neighbor_warp fuer Integer-Klassifikationscodes."""
-    warped = nearest_neighbor_warp(
-        class_array.astype(np.float64), grid, to_proj, x_new, y_new, fill_value=float(NODATA_CLASS)
-    )
-    return np.round(warped).astype(np.int32)
-
-
-# --------------------------------------------------------------------------- #
-# Klassifikation verfeinern (HymecNG-Codes + RV mm/h)
-# --------------------------------------------------------------------------- #
-def fill_unclassifiable(class_merc: np.ndarray,
-                        code: int = FILL_UNCLASSIFIABLE_CODE,
-                        radius: int = FILL_RADIUS_PX,
-                        min_neighbors: int = FILL_MIN_NEIGHBORS) -> np.ndarray:
-    """Ersetzt 'code' durch den häufigsten Niederschlagscode im Kreis um den Pixel."""
-    bad = class_merc == code
-    if not bad.any():
-        return class_merc
-
-    # Kreis-Kernel
-    off = np.arange(-radius, radius + 1)
-    dr, dc = np.meshgrid(off, off, indexing="ij")
-    kernel = (dr * dr + dc * dc <= radius * radius).astype(np.float32)
-
-    # Pro Code zählen, wie oft er im Kreis vorkommt
-    codes = [c for c in PRECIP_SOURCE_CODES if (class_merc == c).any()]
-    if not codes:
-        return class_merc
-
-    counts = np.stack([
-        fftconvolve((class_merc == c).astype(np.float32), kernel, mode="same")
-        for c in codes
-    ])                                   # Form: (n_codes, H, W)
-    counts = np.rint(counts)             # FFT-Rundungsrauschen entfernen
-
-    best_idx = counts.argmax(axis=0)
-    best_cnt = counts.max(axis=0)
-    best_code = np.asarray(codes)[best_idx]
-
-    fill = bad & (best_cnt >= min_neighbors)
-    out = class_merc.copy()
-    out[fill] = best_code[fill]
-    return out
-
-
-def fill_enclosed_holes(class_merc: np.ndarray, max_px: int = 20) -> np.ndarray:
-    """Füllt nur kleine, komplett von Niederschlag umschlossene Löcher (<= max_px Pixel)."""
-    precip = np.isin(class_merc, PRECIP_SOURCE_CODES)
-    holes = ndimage.binary_fill_holes(precip) & ~precip
-    if not holes.any():
-        return class_merc
-
-    labels, n = ndimage.label(holes)
-    sizes = ndimage.sum(holes, labels, index=np.arange(1, n + 1))
-
-    small = np.isin(labels, np.where(sizes <= max_px)[0] + 1)
-    if not small.any():
-        return class_merc
-
-    _, (ir, ic) = ndimage.distance_transform_edt(~precip, return_indices=True)
-    out = class_merc.copy()
-    out[small] = class_merc[ir, ic][small]
-    return out
-
-
-def refine_precipitation_classes(
-    class_merc: np.ndarray,
-    rate_merc: np.ndarray | None,
-) -> np.ndarray:
-    refined = class_merc.copy()
-
-    for base_class, thresholds in REFINEMENT_CONFIG.items():
-        mask_base = class_merc == base_class
-        if not np.any(mask_base):
-            continue
-
-        # Niedrigste Stufe der Klasse: Regen -> 31, Schnee -> 71
-        fallback_code = thresholds[0][2]
-
-        if rate_merc is None:
-            refined[mask_base] = fallback_code
-            continue
-
-        has_rate = ~np.isnan(rate_merc)
-
-        # Pixel mit RV-Wert: nach Schwellen einteilen
-        for lower, upper, new_code in thresholds:
-            m = mask_base & has_rate & (rate_merc >= lower) & (rate_merc < upper)
-            refined[m] = new_code
-
-        # Pixel ohne RV-Wert (NaN / außerhalb des Rasters): Fallback
-        refined[mask_base & ~has_rate] = fallback_code
-
-        # RV-Wert unter der untersten Schwelle: ausblenden
-        refined[mask_base & (refined == base_class)] = INVISIBLE_CLASS
-
-    return refined
-
-
 # --------------------------------------------------------------------------- #
 # Einfärben
 # --------------------------------------------------------------------------- #
-def colorize(class_merc: np.ndarray) -> np.ndarray:
-    rgba = np.zeros((*class_merc.shape, 4), dtype=np.uint8)
-    for cls, hex_color in PRECIP_COLORS.items():
-        r, g, b = hex_to_rgb(hex_color)
-        rgba[class_merc == cls] = (r, g, b, 255)
+def colorize(rate: np.ndarray) -> np.ndarray:
+    """mm/h -> RGBA: weiße Alpha-Rampe (0.01-0.09), darüber diskrete Farbstufen."""
+    thresholds = np.array([t for t, _ in COLOR_TABLE], dtype=np.float64)
+    colors = np.array([c for _, c in COLOR_TABLE], dtype=np.uint8)   # (N, 3)
+
+    rgba = np.zeros((*rate.shape, 4), dtype=np.uint8)
+    visible = np.isfinite(rate) & (rate >= MIN_VISIBLE_MMH)
+    if not visible.any():
+        return rgba
+
+    faint = visible & (rate < thresholds[0])   # 0.01 .. <0.1 -> weiß mit Alpha
+    strong = visible & ~faint
+
+    # Weiß-Rampe: Alpha steigt linear von WHITE_ALPHA_MIN auf WHITE_ALPHA_MAX
+    t = (rate[faint] - MIN_VISIBLE_MMH) / (WHITE_MAX_MMH - MIN_VISIBLE_MMH)
+    t = np.clip(t, 0.0, 1.0)
+    rgba[faint, :3] = 255
+    rgba[faint, 3] = (WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN)).astype(np.uint8)
+
+    # Ab der ersten Schwelle: diskrete Farbstufen wie bisher
+    idx = np.searchsorted(thresholds, rate[strong], side="right") - 1
+    idx = np.clip(idx, 0, len(thresholds) - 1)
+    rgba[strong, :3] = colors[idx]
+    rgba[strong, 3] = 255
     return rgba
-
-
-# --------------------------------------------------------------------------- #
-# Blitze
-# --------------------------------------------------------------------------- #
-def _window_ms(ts: datetime, minutes: int) -> tuple[int, int]:
-    end = int(ts.timestamp() * 1000)
-    return end - minutes * 60_000, end
-
-
-def _fetch_strikes_primary(ts: datetime, minutes: int) -> list[tuple[float, float]]:
-    ts_local = ts.astimezone(BERLIN)
-    url = f"{LIGHTNING_BASE_URL}{ts_local:%Y-%m-%d-%H%M}.json"
-    resp = requests.get(url, timeout=30)
-    if resp.status_code == 404:
-        print(f"Warnung: Primärer Blitz-Feed liefert 404 ({url}) - nutze Backup-API.", file=sys.stderr)
-        raise FileNotFoundError(url)
-    resp.raise_for_status()
-
-    start_ms, end_ms = _window_ms(ts, minutes)
-    return [
-        (s["lat"], s["lon"])
-        for s in resp.json().get("strikes", [])
-        if start_ms <= s.get("t", 0) <= end_ms
-    ]
-
-
-def _fetch_strikes_backup(ts: datetime, minutes: int) -> list[tuple[float, float]]:
-    resp = requests.get(LIGHTNING_BACKUP_URL, timeout=30)
-    resp.raise_for_status()
-
-    start_ms, end_ms = _window_ms(ts, minutes)
-    strikes = []
-    for s in resp.json().get("strikes", []):
-        t_ms = int(datetime.fromisoformat(s["time"].replace("Z", "+00:00")).timestamp() * 1000)
-        if start_ms <= t_ms <= end_ms:
-            strikes.append((s["lat"], s["lon"]))
-    return strikes
-
-
-def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
-    try:
-        return _fetch_strikes_primary(ts, minutes)
-    except FileNotFoundError:
-        return _fetch_strikes_backup(ts, minutes)
-
-
-def apply_lightning_overlay(
-    rgba: np.ndarray,
-    class_merc: np.ndarray,
-    ts: datetime,
-    x_new: np.ndarray,
-    y_new: np.ndarray,
-) -> int:
-    """Färbt Blitze innerhalb von Niederschlagsflächen ein. Gibt die Trefferzahl zurück."""
-    strikes = fetch_recent_strikes(ts)
-    print(f"{len(strikes)} Blitze in den letzten {LIGHTNING_WINDOW_MINUTES} Minuten geladen.")
-
-    out_h, out_w = class_merc.shape
-    radius = LIGHTNING_MARKER_RADIUS_PX
-    color_normal = (*hex_to_rgb(THUNDER_COLOR), 255)
-    color_strong = (*hex_to_rgb(STRONG_THUNDER_COLOR), 255)
-
-    precip_mask = np.isin(class_merc, PRECIP_SOURCE_CODES)   # enthält auch 3
-    hail_mask = np.isin(class_merc, list(HAIL_CLASSES))
-
-    offsets = np.arange(-radius, radius + 1)
-    dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
-    circle = dr * dr + dc * dc <= radius * radius
-
-    x_min, x_max = x_new[0], x_new[-1]
-    y_min, y_max = y_new[0], y_new[-1]
-
-    hits = 0
-    for lat, lon in strikes:
-        sx, sy = lonlat_to_webmercator(lon, lat)
-        if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
-            continue
-        col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
-        row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
-        if not precip_mask[row, col]:
-            continue
-
-        r0, r1 = max(0, row - radius), min(out_h, row + radius + 1)
-        c0, c1 = max(0, col - radius), min(out_w, col + radius + 1)
-        circ = circle[r0 - (row - radius): r1 - (row - radius),
-                      c0 - (col - radius): c1 - (col - radius)]
-
-        area = precip_mask[r0:r1, c0:c1] & circ
-        hail = hail_mask[r0:r1, c0:c1]
-        target = rgba[r0:r1, c0:c1]
-        target[area & hail] = color_strong
-        target[area & ~hail] = color_normal
-        hits += 1
-    return hits
-
-
-# --------------------------------------------------------------------------- #
-# RY laden + auf Zielraster warpen
-# --------------------------------------------------------------------------- #
-def load_brightsky_rate_on_target_grid(ts: datetime, x_new: np.ndarray, y_new: np.ndarray) -> np.ndarray:
-    """Holt RV-Radar (5 min) von Bright Sky und warpt es als mm/h auf das Zielraster."""
-    resp = requests.get(
-        BRIGHTSKY_RADAR_URL,
-        params={"date": ts.isoformat(), "format": "compressed"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    radar = resp.json().get("radar", [])
-    if not radar:
-        raise RuntimeError("Bright Sky lieferte keine Radardaten.")
-    entry = radar[0]
-    print(f"Bright-Sky-Radar: {entry.get('source')} ({entry.get('timestamp')})")
-
-    raw = np.frombuffer(
-        zlib.decompress(base64.b64decode(entry["precipitation_5"])), dtype=np.uint16
-    )
-    if raw.size != BRIGHTSKY_XSIZE * BRIGHTSKY_YSIZE:
-        raise RuntimeError(f"Unerwartete Arraygröße: {raw.size}")
-    raw = raw.reshape(BRIGHTSKY_YSIZE, BRIGHTSKY_XSIZE)
-
-    # 0.01 mm pro 5 min  ->  mm/h
-    rate = raw.astype(np.float64) * 0.01 * 12.0
-    rate[raw == BRIGHTSKY_NODATA] = np.nan
-
-    to_proj = Transformer.from_crs("EPSG:4326", BRIGHTSKY_PROJ, always_xy=True)
-
-    xx, yy = np.meshgrid(x_new, y_new)
-    lon, lat = webmercator_to_lonlat(xx, yy)
-    x_p, y_p = to_proj.transform(lon.ravel(), lat.ravel())
-    x_p = np.asarray(x_p).reshape(xx.shape)
-    y_p = np.asarray(y_p).reshape(xx.shape)
-
-    col = np.floor(x_p / BRIGHTSKY_RES_M).astype(np.int64)
-    row = np.floor(-y_p / BRIGHTSKY_RES_M).astype(np.int64)
-    valid = (col >= 0) & (col < BRIGHTSKY_XSIZE) & (row >= 0) & (row < BRIGHTSKY_YSIZE)
-
-    out = np.full(xx.shape, np.nan, dtype=np.float64)
-    out[valid] = rate[row[valid], col[valid]]
-    return out
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    candidates = sorted(p for p in SRC_DIR.glob("composite_HymecNG_*-hd5") if FILENAME_RE.match(p.name))
+    # Nur Analysedateien (_000), neueste zuletzt
+    candidates = sorted(
+        p for p in SRC_DIR.glob("composite_rv_*-hd5")
+        if FILENAME_RE.match(p.name) and parse_filename(p.name)[1] == 0
+    )
     if not candidates:
-        sys.exit(f"Keine HymecNG-Datei in {SRC_DIR} gefunden.")
+        sys.exit(f"Keine RV-Datei (composite_rv_*_000-hd5) in {SRC_DIR} gefunden.")
     src_path = candidates[-1]
-    ts = parse_timestamp(src_path.name)
+    base_ts, lead_min = parse_filename(src_path.name)
+    ts = base_ts + timedelta(minutes=lead_min)
+    print(f"Quelle: {src_path.name}  ({ts:%Y-%m-%d %H:%M} UTC)")
 
     with h5py.File(src_path, "r") as f:
-        class_array = find_classification_dataset(f)[()].astype(np.int32)
+        rate_native = read_rate_mmh(find_rate_dataset(f))
         where = find_where_group(f)
         if where is None:
             sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht möglich.")
         grid = extract_grid_info(where)
+
+    if rate_native.shape != (grid["ysize"], grid["xsize"]):
+        sys.exit(f"Rastergröße {rate_native.shape} passt nicht zu where-Info "
+                 f"({grid['ysize']} x {grid['xsize']}).")
 
     to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
     to_wgs84 = Transformer.from_crs(grid["projdef"], "EPSG:4326", always_xy=True)
@@ -565,25 +384,8 @@ def main() -> None:
     print(f"EPSG:3857-Extent [xmin, ymin, xmax, ymax]: {extent}")
     print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
 
-    class_merc = warp_classification_to_webmercator(class_array, grid, to_proj, x_new, y_new)
-    class_merc = fill_unclassifiable(class_merc)
-    class_merc = fill_enclosed_holes(class_merc, max_px=5)
-
-    # RY (mm/h) laden und unabhängig auf dasselbe Zielraster warpen
-    rate_merc = None
-    try:
-        rate_merc = load_brightsky_rate_on_target_grid(ts, x_new, y_new)
-    except (RuntimeError, ValueError, zlib.error, requests.RequestException) as e:
-        print(f"Warnung: Bright-Sky-Radar nicht verfügbar ({e}). Regen bleibt ohne Intensitätsstufe.", file=sys.stderr)
-
-    class_refined = refine_precipitation_classes(class_merc, rate_merc)
-    rgba = colorize(class_refined)
-
-    try:
-        hits = apply_lightning_overlay(rgba, class_merc, ts, x_new, y_new)
-        print(f"{hits} Blitz-Treffer eingefärbt (normal: {THUNDER_COLOR}, mit Hagel: {STRONG_THUNDER_COLOR}).")
-    except requests.RequestException as e:
-        print(f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). Überspringe Overlay.", file=sys.stderr)
+    rate_merc = nearest_neighbor_warp(rate_native, grid, to_proj, x_new, y_new, fill_value=np.nan)
+    rgba = colorize(rate_merc)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUT_DIR / f"liveanalyse_{ts.astimezone(BERLIN):%Y%m%d_%H%M}.webp"
