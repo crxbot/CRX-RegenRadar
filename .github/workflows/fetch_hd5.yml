@@ -53,6 +53,8 @@ jobs:
           MONTH=$(date -u +%m)
           DAY=$(date -u +%d)
           DATE=$(date -u +%Y%m%d)
+          BERLIN_TIME=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%H%M)
+          BERLIN_DATE=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%Y%m%d)
 
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
