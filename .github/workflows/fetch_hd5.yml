@@ -12,6 +12,8 @@ env:
   # so viele WEBPs sollen im R2-Bucket max. gleichzeitig liegen
   MAX_KEEP: 12
   R2_PREFIX: liveanalyse
+  WEBP_TARGET_MINUTE: 4
+  WEBP_TARGET_SECOND: 10
 
 jobs:
   fetch_generate_deploy:
@@ -54,6 +56,9 @@ jobs:
 
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "SLOT_EPOCH=$(date -u -d "${YEAR}-${MONTH}-${DAY} ${HOUR}:${MINUTE}:00" +%s)" >> $GITHUB_ENV
+          echo "BERLIN_TIME=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%H%M)" >> $GITHUB_ENV
+          echo "BERLIN_DATE=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%Y%m%d)" >> $GITHUB_ENV
           echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
 
       - name: Download HymecNG composite file from DWD Open Data (mit Retry)
@@ -89,6 +94,21 @@ jobs:
           echo "::error::Datei nach $MAX_ATTEMPTS Versuchen (~$(( MAX_ATTEMPTS * SLEEP_SECONDS / 60 )) Minuten) nicht verfuegbar - Abbruch."
           exit 1
 
+      - name: Warten bis feste Uhrzeit erreicht ist
+        run: |
+          TARGET=$(( SLOT_EPOCH + WEBP_TARGET_MINUTE * 60 + WEBP_TARGET_SECOND ))
+          NOW=$(date -u +%s)
+          WAIT=$(( TARGET - NOW ))
+
+          echo "Slot: ${DATE}_${TIME} | Zielzeit: $(date -u -d "@$TARGET" +%H:%M:%S) UTC | Jetzt: $(date -u -d "@$NOW" +%H:%M:%S) UTC"
+
+          if [ "$WAIT" -gt 0 ]; then
+            echo "Warte ${WAIT}s ..."
+            sleep "$WAIT"
+          else
+            echo "Zielzeit schon ueberschritten - weiter ohne Wartezeit."
+          fi
+
       - name: Generate WEBP for HymecNG
         run: python scripts/generate_webp.py
 
@@ -116,8 +136,8 @@ jobs:
       - name: Upload neue WEBP zu R2
         run: |
           aws s3 cp \
-            "output/hymecng/liveanalyse_${DATE}_${TIME}.webp" \
-            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/liveanalyse_${DATE}_${TIME}.webp" \
+            "output/hymecng/liveanalyse_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
+            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/liveanalyse_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
             --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -136,7 +156,7 @@ jobs:
       - name: Aus dem Fenster gefallene alte WEBPs aus R2 loeschen
         run: |
           if [ -s ./removed_files.txt ]; then
-            while IFS= read -r fname; do
+            while IFS= read -r fname || [ -n "$fname" ]; do
               [ -z "$fname" ] && continue
               echo "Loesche $fname aus R2 ..."
               aws s3 rm \
