@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from scipy.signal import fftconvolve
 import base64
 import zlib
+from scipy import ndimage
 
 import h5py
 import numpy as np
@@ -332,6 +333,26 @@ def fill_unclassifiable(class_merc: np.ndarray,
     return out
 
 
+def fill_enclosed_holes(class_merc: np.ndarray, max_px: int = 20) -> np.ndarray:
+    """Füllt nur kleine, komplett von Niederschlag umschlossene Löcher (<= max_px Pixel)."""
+    precip = np.isin(class_merc, PRECIP_SOURCE_CODES)
+    holes = ndimage.binary_fill_holes(precip) & ~precip
+    if not holes.any():
+        return class_merc
+
+    labels, n = ndimage.label(holes)
+    sizes = ndimage.sum(holes, labels, index=np.arange(1, n + 1))
+
+    small = np.isin(labels, np.where(sizes <= max_px)[0] + 1)
+    if not small.any():
+        return class_merc
+
+    _, (ir, ic) = ndimage.distance_transform_edt(~precip, return_indices=True)
+    out = class_merc.copy()
+    out[small] = class_merc[ir, ic][small]
+    return out
+
+
 def refine_precipitation_classes(
     class_merc: np.ndarray,
     rate_merc: np.ndarray | None,
@@ -343,28 +364,28 @@ def refine_precipitation_classes(
         if not np.any(mask_base):
             continue
 
-        # Niedrigste Stufe der jeweiligen Klasse (Regen -> 31, Schnee -> 71)
+        # Niedrigste Stufe der Klasse: Regen -> 31, Schnee -> 71
         fallback_code = thresholds[0][2]
 
         if rate_merc is None:
-            # Keine RV-Daten: Basis-Klasse in ihre niedrigste Stufe umwandeln
             refined[mask_base] = fallback_code
             continue
 
         has_rate = ~np.isnan(rate_merc)
 
-        # 1) Pixel MIT RV-Wert: nach Schwellen einteilen
+        # Pixel mit RV-Wert: nach Schwellen einteilen
         for lower, upper, new_code in thresholds:
             m = mask_base & has_rate & (rate_merc >= lower) & (rate_merc < upper)
             refined[m] = new_code
 
-        # 2) Pixel OHNE RV-Wert (Nodata / außerhalb des Rasters): Fallback-Stufe
+        # Pixel ohne RV-Wert (NaN / außerhalb des Rasters): Fallback
         refined[mask_base & ~has_rate] = fallback_code
 
-        # 3) Pixel MIT RV-Wert, aber unter der untersten Schwelle: ausblenden
+        # RV-Wert unter der untersten Schwelle: ausblenden
         refined[mask_base & (refined == base_class)] = INVISIBLE_CLASS
 
     return refined
+
 
 # --------------------------------------------------------------------------- #
 # Einfärben
@@ -546,6 +567,7 @@ def main() -> None:
 
     class_merc = warp_classification_to_webmercator(class_array, grid, to_proj, x_new, y_new)
     class_merc = fill_unclassifiable(class_merc)
+    class_merc = fill_enclosed_holes(class_merc, max_px=5)
 
     # RY (mm/h) laden und unabhängig auf dasselbe Zielraster warpen
     rate_merc = None
