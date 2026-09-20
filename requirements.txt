@@ -1,7 +1,7 @@
-numpy>=1.26
-scipy>=1.11
-h5py>=3.10
-pyproj>=3.6
-Pillow>=10.1
-requests>=2.31
-tzdata>=2024.1
+numpy>=2.5.3
+scipy>=1.18.1
+h5py>=3.16.0
+pyproj>=3.8.0
+Pillow>=12.3.0
+requests>=2.34.2
+tzdata>=2026.4
