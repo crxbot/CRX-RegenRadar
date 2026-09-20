@@ -1,47 +1,3 @@
-"""
-Baut eine zentrale meta.json aus allen erzeugten WEBPs in output/.
-
-Erwartetes Dateinamensschema (wie von den Rendering-Skripten erzeugt):
-    {var_type}_{YYYYMMDD}_{HHMM}.webp
-
-var_type darf selbst Unterstriche enthalten (z.B. "tp_acc", "dbz_cmax",
-"change_snow", "liveanalyse") - das Skript erkennt das Zeitstempel-Suffix
-per Regex und nimmt alles davor als var_type.
-
-Aufruf (klassisch, ein Batch-Lauf ohne Rolling-Window):
-    python generate_metadata.py output
-    python generate_metadata.py output --run 18 --date 20260820
-
-Aufruf im Live-Webp-Workflow (HymecNG, alle 5 Minuten, Rolling-Window):
-    python generate_metadata.py output \
-        --run "$RUN" --date "$DATE" \
-        --existing ./metadata_prev.json \
-        --max-keep 12 \
-        --meta-out ./metadata.json \
-        --removed-out ./removed_files.txt
-
-Hintergrund Rolling-Window:
-Bei den Live-Laeufen liegt pro CI-Lauf lokal jeweils nur die NEU erzeugte
-WEBP vor - das Skript kennt an dieser Stelle also nicht, was aktuell
-schon im R2-Bucket liegt. Deshalb kann optional eine vorher aus R2
-heruntergeladene bestehende metadata.json ueber --existing eingelesen
-werden; ihre Timesteps werden mit den neu gefundenen zusammengefuehrt.
-Mit --max-keep wird die Liste pro var_type danach auf die letzten N
-Timesteps gekuerzt (die aeltesten fliegen zuerst raus). Die dabei
-aussortierten Dateinamen werden nach --removed-out geschrieben, damit
-der Workflow sie im Anschluss auch aus R2 loeschen kann.
-
-Ohne --existing verhaelt sich das Skript wie bisher: es baut die
-metadata.json ausschliesslich aus dem, was es lokal in output_dir findet.
-
-Geo-Referenzierung (CRS, Extent) aendert sich nie und steht daher fix als
-Konstante unten im Skript (CRS / EXTENT_3857) - es wird nichts berechnet
-und keine externe Datei nachgeladen.
-
-Keine externen Abhaengigkeiten - laeuft mit reiner Python-Standardbibliothek,
-damit dieser Schritt in der CI kein pip install braucht.
-"""
-
 import argparse
 import json
 import os
@@ -218,7 +174,8 @@ def main():
 
     if args.removed_out:
         with open(args.removed_out, "w", encoding="utf-8") as f:
-            f.write("\n".join(removed_files))
+            if removed_files:
+                f.write("\n".join(removed_files) + "\n")
 
     total_vars = len(meta["var_types"])
     total_files = sum(v["num_steps"] for v in meta["var_types"].values())
