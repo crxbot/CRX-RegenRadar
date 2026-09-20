@@ -45,23 +45,22 @@ jobs:
       - name: Set RUN and DATE (rounded to 5 min, UTC)
         id: set_run_date
         run: |
-          HOUR=$(date -u +%H)
-          MINUTE_RAW=$(date -u +%M)
-          MINUTE=$(( (10#$MINUTE_RAW / 5) * 5 ))
-          TIME=$(printf "%02d%02d" "$HOUR" "$MINUTE")
-          YEAR=$(date -u +%Y)
-          MONTH=$(date -u +%m)
-          DAY=$(date -u +%d)
-          DATE=$(date -u +%Y%m%d)
+          NOW=$(date -u +%s)
+          SLOT_EPOCH=$(( NOW / 300 * 300 ))
+
+          TIME=$(date -u -d "@$SLOT_EPOCH" +%H%M)
+          DATE=$(date -u -d "@$SLOT_EPOCH" +%Y%m%d)
           BERLIN_TIME=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%H%M)
           BERLIN_DATE=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%Y%m%d)
 
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
-          echo "SLOT_EPOCH=$(date -u -d "${YEAR}-${MONTH}-${DAY} ${HOUR}:${MINUTE}:00" +%s)" >> $GITHUB_ENV
-          echo "BERLIN_TIME=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%H%M)" >> $GITHUB_ENV
-          echo "BERLIN_DATE=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%Y%m%d)" >> $GITHUB_ENV
+          echo "SLOT_EPOCH=$SLOT_EPOCH" >> $GITHUB_ENV
+          echo "BERLIN_TIME=$BERLIN_TIME" >> $GITHUB_ENV
+          echo "BERLIN_DATE=$BERLIN_DATE" >> $GITHUB_ENV
           echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
+
+          echo "UTC-Slot: ${DATE}_${TIME} | Berlin: ${BERLIN_DATE}_${BERLIN_TIME}"
 
       - name: Download HymecNG composite file from DWD Open Data (mit Retry)
         run: |
