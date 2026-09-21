@@ -339,7 +339,7 @@ def colorize(rate: np.ndarray) -> np.ndarray:
     # Alpha-Rampe: steigt linear von WHITE_ALPHA_MIN auf WHITE_ALPHA_MAX
     t = (rate[faint] - MIN_VISIBLE_MMH) / (WHITE_MAX_MMH - MIN_VISIBLE_MMH)
     t = np.clip(t, 0.0, 1.0)
-    rgba[faint, :3] = colors[0]          # <- statt 255 (Weiß) jetzt erste Farbe der Tabelle
+    rgba[faint, :3] = 255         # <- statt 255 (Weiß) jetzt erste Farbe der Tabelle
     rgba[faint, 3] = (WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN)).astype(np.uint8)
 
     # Ab der ersten Schwelle: diskrete Farbstufen wie bisher
