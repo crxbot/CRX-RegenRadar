@@ -179,7 +179,6 @@ def _scalar(v):
 
 def read_rate_mmh(ds: h5py.Dataset) -> np.ndarray:
     """Liest das Dataset und gibt mm/h als float64 zurueck (NaN = kein Datum)."""
-    # 'what'-Gruppe der Daten, sonst eine Ebene hoeher, sonst Root
     what = None
     for grp in (ds.parent, ds.parent.parent, ds.file):
         w = grp.get("what")
@@ -195,9 +194,13 @@ def read_rate_mmh(ds: h5py.Dataset) -> np.ndarray:
     quantity = _attr_str(attrs.get("quantity", "")).upper()
 
     raw = ds[()]
+    # Pixelwert * gain = 5-Minuten-Niederschlagsmenge M[mm] (siehe DWD-Formatbeschreibung)
     values = raw.astype(np.float64) * gain + offset
 
-    factor = 60.0 / RV_ACCUM_MINUTES if "ACRR" in quantity else 1.0
+    # RV ist immer ein 5-min-Produkt -> immer auf mm/h hochrechnen,
+    # unabhaengig davon, wie 'quantity' in der Datei benannt ist
+    # (DWD nutzt hier oft "RATE" statt ODIM-konform "ACRR").
+    factor = 60.0 / RV_ACCUM_MINUTES
     values *= factor
 
     values[raw == nodata] = np.nan
@@ -321,7 +324,7 @@ def nearest_neighbor_warp(
 # Einfärben
 # --------------------------------------------------------------------------- #
 def colorize(rate: np.ndarray) -> np.ndarray:
-    """mm/h -> RGBA: weiße Alpha-Rampe (0.01-0.09), darüber diskrete Farbstufen."""
+    """mm/h -> RGBA: Alpha-Rampe in Farbe der ersten Stufe (0.01-0.09), darüber diskrete Farbstufen."""
     thresholds = np.array([t for t, _ in COLOR_TABLE], dtype=np.float64)
     colors = np.array([c for _, c in COLOR_TABLE], dtype=np.uint8)   # (N, 3)
 
@@ -330,13 +333,13 @@ def colorize(rate: np.ndarray) -> np.ndarray:
     if not visible.any():
         return rgba
 
-    faint = visible & (rate < thresholds[0])   # 0.01 .. <0.1 -> weiß mit Alpha
+    faint = visible & (rate < thresholds[0])   # 0.01 .. <0.1 -> erste Farbe mit Alpha-Rampe
     strong = visible & ~faint
 
-    # Weiß-Rampe: Alpha steigt linear von WHITE_ALPHA_MIN auf WHITE_ALPHA_MAX
+    # Alpha-Rampe: steigt linear von WHITE_ALPHA_MIN auf WHITE_ALPHA_MAX
     t = (rate[faint] - MIN_VISIBLE_MMH) / (WHITE_MAX_MMH - MIN_VISIBLE_MMH)
     t = np.clip(t, 0.0, 1.0)
-    rgba[faint, :3] = 255
+    rgba[faint, :3] = colors[0]          # <- statt 255 (Weiß) jetzt erste Farbe der Tabelle
     rgba[faint, 3] = (WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN)).astype(np.uint8)
 
     # Ab der ersten Schwelle: diskrete Farbstufen wie bisher
