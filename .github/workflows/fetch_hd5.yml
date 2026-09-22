@@ -10,7 +10,7 @@ concurrency:
 
 env:
   # so viele WEBPs sollen im R2-Bucket max. gleichzeitig liegen
-  MAX_KEEP: 12
+  MAX_KEEP: 48
   R2_PREFIX: regenradar
 
 jobs:
