@@ -111,7 +111,7 @@ COLOR_TABLE: list[tuple[float, tuple[int, int, int]]] = [
 
 # Geometrie / Ausgabe
 BERLIN = ZoneInfo("Europe/Berlin")
-WEBMERCATOR_OUT_WIDTH = 1400
+WEBMERCATOR_OUT_WIDTH = 1927
 EDGE_SAMPLES = 200
 BBOX_MARGIN_DEG = 0.02
 EARTH_RADIUS = 6378137.0
