@@ -343,7 +343,7 @@ def colorize(rate: np.ndarray) -> np.ndarray:
     rgba[faint, 3] = (WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN)).astype(np.uint8)
 
     # Ab der ersten Schwelle: diskrete Farbstufen wie bisher
-    idx = np.searchsorted(thresholds, rate[strong], side="right") - 1
+    idx = np.searchsorted(thresholds - 1e-6, rate[strong], side="right") - 1
     idx = np.clip(idx, 0, len(thresholds) - 1)
     rgba[strong, :3] = colors[idx]
     rgba[strong, 3] = 255
