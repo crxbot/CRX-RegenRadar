@@ -26,7 +26,6 @@ RV_ACCUM_MINUTES = 5
 RV_DEFAULT_GAIN = 0.01
 RV_DEFAULT_NODATA = 65535
 
-MIN_VISIBLE_MMH = 0.01      # darunter: transparent
 WHITE_MAX_MMH = 0.09        # ab hier volle Weiß-Deckkraft der Rampe
 WHITE_ALPHA_MIN = 20        # Alpha bei 0.01 mm/h (0-255)
 WHITE_ALPHA_MAX = 160       # Alpha bei 0.09 mm/h (0-255)
