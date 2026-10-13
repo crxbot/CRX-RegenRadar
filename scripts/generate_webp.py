@@ -285,8 +285,10 @@ def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
     x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
     aspect = (y_max - y_min) / (x_max - x_min)
     out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
-    y_new = np.linspace(y_min, y_max, out_h)
+    dx = (x_max - x_min) / WEBMERCATOR_OUT_WIDTH
+    dy = (y_max - y_min) / out_h
+    x_new = x_min + (np.arange(WEBMERCATOR_OUT_WIDTH) + 0.5) * dx
+    y_new = y_min + (np.arange(out_h) + 0.5) * dy
     return x_new, y_new, [x_min, y_min, x_max, y_max]
 
 
