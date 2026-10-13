@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""RV-Composite (DWD, ODIM-HDF5) -> farbiges WebP in EPSG:3857."""
+"""RV-Composite (DWD, ODIM-HDF5) -> NATIVES DWD-Raster (1100 x 1200, stereographisch).
+
+Kein Warp nach Web Mercator, kein WebP. Ausgabe: rohe uint8-Bytes, keine Dateiendung.
+Layout: ysize Zeilen x xsize Spalten, row-major, Zeile 0 = Norden (wie im HDF5).
+Dateigroesse immer exakt xsize * ysize = 1.320.000 Bytes.
+
+Jeder Pixel ist ein CODE (0-255), der Client faerbt ihn per Tabelle ein:
+    0        kein Regen (unter MIN_VISIBLE_MMH)  -> transparent
+    1 .. 9   schwacher Regen 0.01 .. 0.09 mm/h (Code = floor(mm/h * 100)), weiss mit Alpha-Rampe
+    10 ..    Stufen der COLOR_TABLE: Code = 10 + Nummer der Stufe (0 = 0.1 mm/h, 1 = 0.12 mm/h, ...)
+    255      kein Daten / ausserhalb  -> transparent
+
+Farbtabelle fuer den Client (radar-colors.js) ausgeben:   python3 rv_native.py --colors
+"""
+import json
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -8,7 +22,6 @@ from zoneinfo import ZoneInfo
 
 import h5py
 import numpy as np
-from PIL import Image
 from pyproj import Transformer
 
 # --------------------------------------------------------------------------- #
@@ -19,21 +32,24 @@ OUT_DIR = Path("output/rv")
 
 FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
 
-# Falls das Dataset als Akkumulation (quantity=ACRR) vorliegt: Laenge des
-# Akkumulationsintervalls in Minuten -> Umrechnung auf mm/h (RV = 5 min).
+# Falls das Dataset als Akkumulation vorliegt: Laenge des Intervalls in Minuten (RV = 5 min)
 RV_ACCUM_MINUTES = 5
 # Fallbacks, falls die Attribute (gain/nodata) in der Datei fehlen
 RV_DEFAULT_GAIN = 0.01
 RV_DEFAULT_NODATA = 65535
 
-WHITE_MAX_MMH = 0.09        # ab hier volle Weiß-Deckkraft der Rampe
+MIN_VISIBLE_MMH = 0.01      # darunter: Code 0 (transparent)
+WHITE_MAX_MMH = 0.09        # ab hier volle Deckkraft der Rampe
 WHITE_ALPHA_MIN = 20        # Alpha bei 0.01 mm/h (0-255)
 WHITE_ALPHA_MAX = 160       # Alpha bei 0.09 mm/h (0-255)
+FAINT_RGB = (255, 255, 255) # Farbe der schwachen Stufe (Codes 1-9)
+
+NODATA_CODE = 255
+FAINT_CODE_MAX = 9          # Codes 1..9 = 0.01 .. 0.09 mm/h
+STEP_CODE_OFFSET = 10       # Code der ersten COLOR_TABLE-Stufe
 
 # Farbtabelle: (mm/h, (R, G, B))
 # Diskrete Stufen: jeder Wert bekommt die Farbe der letzten Schwelle <= Wert.
-MIN_VISIBLE_MMH = 0.01      # darunter: transparent
-
 COLOR_TABLE: list[tuple[float, tuple[int, int, int]]] = [
     (0.1,   (0, 221, 238)),
     (0.12,  (0, 206, 240)),
@@ -107,30 +123,14 @@ COLOR_TABLE: list[tuple[float, tuple[int, int, int]]] = [
     (446.4, (152, 20, 152)),
     (491.0, (140, 0, 140)),
 ]
+assert STEP_CODE_OFFSET + len(COLOR_TABLE) <= NODATA_CODE, "Zu viele Stufen fuer uint8"
 
-# Geometrie / Ausgabe
 BERLIN = ZoneInfo("Europe/Berlin")
-WEBMERCATOR_OUT_WIDTH = 1927
-EDGE_SAMPLES = 200
-BBOX_MARGIN_DEG = 0.02
-EARTH_RADIUS = 6378137.0
 
 
 # --------------------------------------------------------------------------- #
 # Hilfsfunktionen
 # --------------------------------------------------------------------------- #
-def lonlat_to_webmercator(lon_deg, lat_deg):
-    x = EARTH_RADIUS * np.radians(lon_deg)
-    y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
-    return x, y
-
-
-def webmercator_to_lonlat(x, y):
-    lon = np.degrees(x / EARTH_RADIUS)
-    lat = np.degrees(2 * np.arctan(np.exp(y / EARTH_RADIUS)) - np.pi / 2)
-    return lon, lat
-
-
 def parse_filename(filename: str) -> tuple[datetime, int]:
     """Liefert (Basiszeit UTC, Vorhersageschritt in Minuten) aus dem RV-Dateinamen."""
     m = FILENAME_RE.match(filename)
@@ -142,6 +142,14 @@ def parse_filename(filename: str) -> tuple[datetime, int]:
     date_str, time_str, lead_str = m.groups()
     naive = datetime.strptime(date_str + time_str, "%Y%m%d%H%M")
     return naive.replace(tzinfo=timezone.utc), int(lead_str)
+
+
+def _attr_str(v) -> str:
+    return v.decode(errors="ignore") if isinstance(v, bytes) else str(v)
+
+
+def _scalar(v):
+    return v.item() if isinstance(v, np.ndarray) and v.size == 1 else v
 
 
 # --------------------------------------------------------------------------- #
@@ -168,14 +176,6 @@ def find_rate_dataset(h5file: h5py.File) -> h5py.Dataset:
     return candidates[0]
 
 
-def _attr_str(v) -> str:
-    return v.decode(errors="ignore") if isinstance(v, bytes) else str(v)
-
-
-def _scalar(v):
-    return v.item() if isinstance(v, np.ndarray) and v.size == 1 else v
-
-
 def read_rate_mmh(ds: h5py.Dataset) -> np.ndarray:
     """Liest das Dataset und gibt mm/h als float64 zurueck (NaN = kein Datum)."""
     what = None
@@ -198,7 +198,6 @@ def read_rate_mmh(ds: h5py.Dataset) -> np.ndarray:
 
     # RV ist immer ein 5-min-Produkt -> immer auf mm/h hochrechnen,
     # unabhaengig davon, wie 'quantity' in der Datei benannt ist
-    # (DWD nutzt hier oft "RATE" statt ODIM-konform "ACRR").
     factor = 60.0 / RV_ACCUM_MINUTES
     values *= factor
 
@@ -255,106 +254,61 @@ def extract_grid_info(where: h5py.Group) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Geometrie / Warp
+# mm/h -> Code
 # --------------------------------------------------------------------------- #
-def native_origin_and_extent(grid: dict, to_proj: Transformer):
-    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
-    x_max = ll_x + grid["xsize"] * grid["xscale"]
-    y_max = ll_y + grid["ysize"] * grid["yscale"]
-    return ll_x, ll_y, x_max, y_max
-
-
-def wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84: Transformer):
-    """WGS84-Bounding-Box durch Abtasten des nativen Rasterrands."""
-    t = np.linspace(0.0, 1.0, EDGE_SAMPLES)
-    xs_span = ll_x + t * (x_max - ll_x)
-    ys_span = ll_y + t * (y_max - ll_y)
-    xs = np.concatenate([xs_span, xs_span, np.full_like(ys_span, ll_x), np.full_like(ys_span, x_max)])
-    ys = np.concatenate([np.full_like(xs_span, ll_y), np.full_like(xs_span, y_max), ys_span, ys_span])
-    lons, lats = (np.asarray(a) for a in to_wgs84.transform(xs, ys))
-    return (
-        float(lons.min()) - BBOX_MARGIN_DEG,
-        float(lons.max()) + BBOX_MARGIN_DEG,
-        float(lats.min()) - BBOX_MARGIN_DEG,
-        float(lats.max()) + BBOX_MARGIN_DEG,
-    )
-
-
-def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
-    x_min, y_min = lonlat_to_webmercator(lon_min, lat_min)
-    x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
-    aspect = (y_max - y_min) / (x_max - x_min)
-    out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    dx = (x_max - x_min) / WEBMERCATOR_OUT_WIDTH
-    dy = (y_max - y_min) / out_h
-    x_new = x_min + (np.arange(WEBMERCATOR_OUT_WIDTH) + 0.5) * dx
-    y_new = y_min + (np.arange(out_h) + 0.5) * dy
-    return x_new, y_new, [x_min, y_min, x_max, y_max]
-
-
-def nearest_neighbor_warp(
-    data: np.ndarray,
-    grid: dict,
-    to_proj: Transformer,
-    x_new: np.ndarray,
-    y_new: np.ndarray,
-    fill_value: float = np.nan,
-) -> np.ndarray:
-    """Nearest-Neighbor-Warp des nativen Rasters auf das EPSG:3857-Zielraster."""
-    xx, yy = np.meshgrid(x_new, y_new)
-    lon, lat = webmercator_to_lonlat(xx, yy)
-    x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
-    x_nat = np.asarray(x_nat).reshape(xx.shape)
-    y_nat = np.asarray(y_nat).reshape(xx.shape)
-
-    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
-
-    # ODIM: LL_lon/LL_lat = untere linke Ecke des Rasters -> floor
-    # (bei 1 km Aufloesung ist der Unterschied zu round() nur ein halber Pixel;
-    #  falls das Bild gegenueber frueher verschoben wirkt, hier wieder round() nehmen)
-    col = np.floor((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
-    row = (grid["ysize"] - 1 - np.floor((y_nat - ll_y) / grid["yscale"])).astype(np.int64)
-    valid = (col >= 0) & (col < grid["xsize"]) & (row >= 0) & (row < grid["ysize"])
-
-    out = np.full(xx.shape, fill_value, dtype=np.float64)
-    out[valid] = data[row[valid], col[valid]]
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Einfärben
-# --------------------------------------------------------------------------- #
-def colorize(rate: np.ndarray) -> np.ndarray:
-    """mm/h -> RGBA: Alpha-Rampe in Farbe der ersten Stufe (0.01-0.09), darüber diskrete Farbstufen."""
+def encode_codes(rate: np.ndarray) -> np.ndarray:
+    """mm/h (nativ) -> uint8-Codes. Gleiche Stufen-Logik wie das alte colorize()."""
     thresholds = np.array([t for t, _ in COLOR_TABLE], dtype=np.float64)
-    colors = np.array([c for _, c in COLOR_TABLE], dtype=np.uint8)   # (N, 3)
 
-    rgba = np.zeros((*rate.shape, 4), dtype=np.uint8)
-    visible = np.isfinite(rate) & (rate >= MIN_VISIBLE_MMH)
-    if not visible.any():
-        return rgba
+    codes = np.zeros(rate.shape, dtype=np.uint8)            # 0 = kein Regen
+    finite = np.isfinite(rate)
+    codes[~finite] = NODATA_CODE
 
-    faint = visible & (rate < thresholds[0])   # 0.01 .. <0.1 -> erste Farbe mit Alpha-Rampe
+    visible = finite & (rate >= MIN_VISIBLE_MMH)
+    faint = visible & (rate < thresholds[0])                # 0.01 .. <0.1
     strong = visible & ~faint
 
-    # Alpha-Rampe: steigt linear von WHITE_ALPHA_MIN auf WHITE_ALPHA_MAX
-    t = (rate[faint] - MIN_VISIBLE_MMH) / (WHITE_MAX_MMH - MIN_VISIBLE_MMH)
-    t = np.clip(t, 0.0, 1.0)
-    rgba[faint, :3] = 255         # <- statt 255 (Weiß) jetzt erste Farbe der Tabelle
-    rgba[faint, 3] = (WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN)).astype(np.uint8)
+    # schwach: 0.01 -> 1, 0.02 -> 2, ... 0.09 -> 9
+    k = np.floor(rate[faint] * 100 + 1e-6)
+    codes[faint] = np.clip(k, 1, FAINT_CODE_MAX).astype(np.uint8)
 
-    # Ab der ersten Schwelle: diskrete Farbstufen wie bisher
+    # ab der ersten Schwelle: Nummer der Stufe + Offset
     idx = np.searchsorted(thresholds - 1e-6, rate[strong], side="right") - 1
     idx = np.clip(idx, 0, len(thresholds) - 1)
-    rgba[strong, :3] = colors[idx]
-    rgba[strong, 3] = 255
-    return rgba
+    codes[strong] = (STEP_CODE_OFFSET + idx).astype(np.uint8)
+    return codes
+
+
+# --------------------------------------------------------------------------- #
+# Farbtabelle fuer den Client (radar-colors.js)
+# --------------------------------------------------------------------------- #
+def print_client_colors() -> None:
+    fr, fg, fb = FAINT_RGB
+    print("  regenradar: {")
+    print("    exact: true,            // jeder Code gilt nur fuer sich")
+    print(f"    nodata: [0, {NODATA_CODE}],")
+    print("    steps: [")
+    print("      // schwacher Regen 0.01 - 0.09 mm/h (Alpha-Rampe)")
+    for code in range(1, FAINT_CODE_MAX + 1):
+        t = (code * 0.01 - MIN_VISIBLE_MMH) / (WHITE_MAX_MMH - MIN_VISIBLE_MMH)
+        t = min(max(t, 0.0), 1.0)
+        alpha = int(WHITE_ALPHA_MIN + t * (WHITE_ALPHA_MAX - WHITE_ALPHA_MIN))
+        print(f"      [{code}, '#{fr:02x}{fg:02x}{fb:02x}{alpha:02x}'],   // {code * 0.01:.2f} mm/h")
+    print("      // ab 0.1 mm/h")
+    for i, (mmh, (r, g, b)) in enumerate(COLOR_TABLE):
+        print(f"      [{STEP_CODE_OFFSET + i}, '#{r:02x}{g:02x}{b:02x}'],   // ab {mmh} mm/h")
+    print("    ],")
+    print("  },")
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    if "--colors" in sys.argv:
+        print_client_colors()
+        return
+
     # Nur Analysedateien (_000), neueste zuletzt
     candidates = sorted(
         p for p in SRC_DIR.glob("composite_rv_*-hd5")
@@ -368,34 +322,40 @@ def main() -> None:
     print(f"Quelle: {src_path.name}  ({ts:%Y-%m-%d %H:%M} UTC)")
 
     with h5py.File(src_path, "r") as f:
-        rate_native = read_rate_mmh(find_rate_dataset(f))
+        rate = read_rate_mmh(find_rate_dataset(f))
         where = find_where_group(f)
         if where is None:
-            sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht möglich.")
+            sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden.")
         grid = extract_grid_info(where)
 
-    if rate_native.shape != (grid["ysize"], grid["xsize"]):
-        sys.exit(f"Rastergröße {rate_native.shape} passt nicht zu where-Info "
-                 f"({grid['ysize']} x {grid['xsize']}).")
+    h, w = rate.shape
+    if (w, h) != (grid["xsize"], grid["ysize"]):
+        sys.exit(f"Rastergroesse passt nicht: Array {w}x{h}, where {grid['xsize']}x{grid['ysize']}")
+    print(f"Natives Raster: {w} x {h} px, {grid['xscale']} m / px")
 
-    to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
-    to_wgs84 = Transformer.from_crs(grid["projdef"], "EPSG:4326", always_xy=True)
+    codes = encode_codes(rate)
 
-    ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid, to_proj)
-    lon_min, lon_max, lat_min, lat_max = wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84)
-    x_new, y_new, extent = webmercator_target_grid(lon_min, lon_max, lat_min, lat_max)
-    print(f"WGS84-BBox: lon [{lon_min:.4f}, {lon_max:.4f}], lat [{lat_min:.4f}, {lat_max:.4f}]")
-    print(f"EPSG:3857-Extent [xmin, ymin, xmax, ymax]: {extent}")
-    print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
-
-    rate_merc = nearest_neighbor_warp(rate_native, grid, to_proj, x_new, y_new, fill_value=np.nan)
-    rgba = colorize(rate_merc)
-
+    # Speichern: rohe Bytes, keine Dateiendung, Zeile 0 = Norden
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / f"regenradar_{ts.astimezone(BERLIN):%Y%m%d_%H%M}.webp"
-    # Zeilen umdrehen: y_new läuft von Süd nach Nord, Bilder von oben nach unten
-    Image.fromarray(rgba[::-1], mode="RGBA").save(out_path, format="WEBP", lossless=True)
-    print(f"Gespeichert: {out_path}")
+    out_path = OUT_DIR / f"regenradar_{ts.astimezone(BERLIN):%Y%m%d_%H%M}"
+    np.ascontiguousarray(codes).tofile(out_path)
+    print(f"Gespeichert: {out_path} ({w}x{h}, {codes.nbytes} Bytes)")
+
+    # Metadaten fuer den Client (einmalig kopieren, aendern sich nicht)
+    to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
+    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
+    meta = {
+        "format": "raw-uint8",
+        "width": w,
+        "height": h,
+        "row_order": "north-to-south",
+        "projdef": grid["projdef"],
+        "pixel_size_m": grid["xscale"],
+        "ll_x": ll_x,
+        "ll_y": ll_y,
+        "extent_native": [ll_x, ll_y, ll_x + w * grid["xscale"], ll_y + h * grid["yscale"]],
+    }
+    print("Client-Metadaten:", json.dumps(meta))
 
 
 if __name__ == "__main__":
