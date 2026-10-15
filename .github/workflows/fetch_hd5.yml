@@ -128,7 +128,8 @@ jobs:
       
       - name: Gzip der Binaerdatei
         run: |
-          gzip -9 -n -k "output/rv/regenradar_${BERLIN_DATE}_${BERLIN_TIME}"
+          f="output/rv/regenradar_${BERLIN_DATE}_${BERLIN_TIME}"
+          gzip -9 -n -c "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 
       - name: Upload neue Binaerdatei zu R2
         run: |
